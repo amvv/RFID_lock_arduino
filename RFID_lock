@@ -1,0 +1,406 @@
+i/**
+ *  @title:  StrongLink SL018/SL030 RFID reader demo
+ *  @author: marc@marcboon.com
+ *  @see:    http://www.stronglink.cn/english/sl018.htm
+ *  @see:    http://www.stronglink.cn/english/sl030.htm
+ *
+ *  Arduino to SL018/SL030 wiring:
+ *  A3/TAG     1      5
+ *  A4/SDA     2      3
+ *  A5/SCL     3      4
+ *  5V         4      -
+ *  GND        5      6
+ *  3V3        -      1
+ */
+
+#include <avr/sleep.h>
+#include <avr/wdt.h>
+#include <RF12.h>
+#include <Ports.h>
+#include <Wire.h>
+
+#ifndef cbi
+#define cbi(sfr, bit) (_SFR_BYTE(sfr) &= ~_BV(bit))
+#endif
+#ifndef sbi
+#define sbi(sfr, bit) (_SFR_BYTE(sfr) |= _BV(bit))
+#endif
+
+
+
+#define TAG_PIN (5) // A3
+#define RFID_SLEEP_PIN (15) // A3
+#define OPEN_DOOR_PIN (3) // interrupt 1 - digital 3 in arduino
+#define DOOR_TRIGGER_PIN (6)
+#define MAX_FAIL (5)
+#define DOOR_OPEN_TIME (2500)
+#define REPORTING_LOOPS (14400)
+
+#define ENTRY_DENIED    (255)
+#define SYSTEM_LOCKED   (254)
+#define SYSTEM_UNLOCKED (253)
+#define BUTTON_OPENED   (252)
+#define SYSTEM_BOOT     (251)
+
+typedef struct {
+        unsigned int house;
+	unsigned int device;
+	unsigned int seq;
+	unsigned int card;
+} RFIDData;
+
+unsigned int seqnum = 0;
+
+unsigned long int loops = REPORTING_LOOPS;
+
+
+byte failed = 0;
+boolean blocked = false;
+boolean tag_present = false;
+boolean open_door_pressed = true;
+boolean open_door_pressed_last = true;
+boolean tag_last = true;
+RFIDData buf;
+boolean data_to_send = false;
+
+char* mifare[] = { "1K", "Pro", "UltraLight", "4K", "ProX", "DesFire" };
+
+unsigned long list[10] = {1234567890, // input here the numbers of the cards
+                         0,
+                         0,
+                         0,
+                         0,
+                         0,
+                         0,
+                         0,
+                         0,
+                         0  
+};
+
+
+void setup()
+{
+
+  rf12_initialize(10, RF12_868MHZ, 212);
+
+  // Init serial port to host and I2C interface to SL018/SL030
+  //Serial.begin(9600);
+  Wire.begin(0x50);
+  pinMode(RFID_SLEEP_PIN, OUTPUT);
+  pinMode(TAG_PIN, INPUT);
+  pinMode(DOOR_TRIGGER_PIN, OUTPUT);
+  digitalWrite(DOOR_TRIGGER_PIN, LOW);
+  digitalWrite(RFID_SLEEP_PIN, HIGH);
+  delay(100);
+  Wire.beginTransmission(0x50);
+  Wire.send(1);
+  Wire.send(0x50);
+  Wire.endTransmission();
+  delay(1000);
+  digitalWrite(RFID_SLEEP_PIN, HIGH);
+
+  // Prompt for tag
+  //Serial.println("Show me your tag");
+  setup_watchdog(6);
+  
+  blocked = false;
+  
+  buf.house = 192;
+  buf.device = 3;
+  
+  rf12_sleep(0);
+}
+
+void loop()
+{
+  // Wait for tag
+  //sleep_disable();
+    loops++;
+  
+  if (blocked == false)
+  {
+    tag_present = digitalRead(TAG_PIN);
+    if ((tag_present == false) && (tag_last == true)) //tag present
+    {
+
+      // Read tag ID
+      unsigned long result = readID();
+      //check permission
+      byte enter = check_permission(result);
+      
+      if (enter == true)
+      {//accepted
+      
+      //call open_door with 3 seconds
+
+        failed = 0;
+        //Serial.println("entry allowed");
+        //send radio message
+      
+        buf.seq = ++seqnum;
+      
+        data_to_send = true;
+
+        open_the_door();
+      }
+      else
+      {
+        failed = failed++;
+        //Serial.println("entry denied");
+
+        buf.seq = ++seqnum;
+        buf.card = ENTRY_DENIED;
+        data_to_send = true;
+
+       
+        //send radio message
+      }
+    }
+    tag_last = tag_present;
+    if (failed >= MAX_FAIL)
+    {
+      blocked = true;
+      //Serial.println("system blocked");
+      buf.seq = ++seqnum;
+      buf.card = SYSTEM_LOCKED;
+      data_to_send = true;
+        //send radio message
+    }
+  //Serial.print(loops);
+  //Serial.println("no tag");
+  }
+else
+{
+    //Serial.println("blocked");
+}
+
+
+  Wire.beginTransmission(0x50);
+  Wire.send(1);
+  Wire.send(0x50);
+  Wire.endTransmission();
+    
+  //Serial.print(res);
+  delay(10);
+
+  
+  //Check for Hardware button and open door if pressed
+  
+   open_door_pressed = digitalRead(OPEN_DOOR_PIN);
+
+  if ((open_door_pressed) == false && (open_door_pressed_last == true))
+  {
+    if (blocked== true)
+    {
+      //Serial.println("UNBLOCK!");
+      blocked = false;
+      failed = 0;
+      buf.seq = ++seqnum;
+      buf.card = SYSTEM_UNLOCKED;
+      data_to_send = true;
+    }
+    else
+    {
+      //Serial.println("open door!");
+      open_the_door();
+      buf.seq = ++seqnum;
+      buf.card = BUTTON_OPENED;
+      data_to_send = true;
+    }
+  }
+  open_door_pressed_last = open_door_pressed;
+  
+  if ((loops >= REPORTING_LOOPS) && (data_to_send == false)) //once every 4 hours report the battery status
+  {
+    byte bat = 0;
+    bat = rf12_lowbat() + 250;
+    loops = 0;
+    buf.seq = ++seqnum;
+    buf.card = bat;
+    data_to_send = true;
+  }
+  
+  
+  //check if data ready to be sent and send it if so:
+  if (data_to_send == true)
+  {
+    data_to_send = false;
+    
+    rf12_sleep(-1);
+      while (!rf12_canSend())	// wait until sending is allowed
+       rf12_recvDone();
+
+       rf12_sendStart(0, &buf, sizeof buf);
+
+      while (!rf12_canSend())	// wait until sending has been completed
+         rf12_recvDone();
+         delay(5);
+      rf12_sleep(0);
+  }
+
+  
+  
+  
+  system_sleep();
+  if (blocked == false)
+  {
+
+    digitalWrite(RFID_SLEEP_PIN, LOW);
+    delay(40); //if it does not detect increase this delay
+    digitalWrite(RFID_SLEEP_PIN, HIGH);
+  }
+}
+
+unsigned long readID()
+{
+  // Send SELECT command
+  Wire.beginTransmission(0x50);
+  Wire.send(1);
+  Wire.send(1);
+  Wire.endTransmission();
+
+  // Wait for response
+  while(!digitalRead(TAG_PIN))
+  {
+    // Allow some time to respond
+    delay(50);
+    
+    // Anticipate maximum packet size
+    Wire.requestFrom(0x50, 11);
+    if(Wire.available())
+    {
+      // Get length of packet
+      byte len = Wire.receive();
+      
+      // Wait until whole packet is received
+      while(Wire.available() < len)
+      {
+        // Quit if no response before tag left
+        if(digitalRead(TAG_PIN)) return 0;
+      }
+
+      // Read command code, should be same as request (1)
+      byte command = Wire.receive();
+      if(command != 1) return -1;
+
+      // Read status
+      byte status = Wire.receive();
+      switch(status)
+      {
+        case 0: // Succes, read ID and tag type
+        {
+          len -= 2;
+          // Get tag ID
+          unsigned long numero = 0;
+          byte bytes_counted = 0;
+          while(--len)
+          {
+            
+            byte data = Wire.receive();
+            if (bytes_counted < 4)
+            {
+              numero = numero * 256 + data;
+              bytes_counted++;
+            }
+            //if(data < 0x10) Serial.print(0);
+            //Serial.print(data, HEX);
+            
+          }
+          // Get tag type
+          byte type = Wire.receive();
+          if(type > 0 && type < sizeof(mifare))
+          {
+            //Serial.print(" Mifare ");
+            //Serial.print(mifare[type - 1]);
+          }
+          return numero;
+        }
+        break;
+
+      case 0x0A: // Collision
+        //Serial.println("Collision detected");
+        break;
+
+      case 1: // No tag
+        //Serial.println("No tag found");
+        break;
+
+      default: ;// Unexpected
+        //Serial.println("Unexpected result");
+      }
+      return -1;
+    }
+  }
+  // No tag found or no response
+  return 0;
+}
+
+byte check_permission(unsigned long ID)
+
+{
+  byte iterator;
+  while (list[iterator] != 0)
+  {
+    if (list[iterator] == ID)
+    {
+      //Serial.println("Entry allowed!");
+      buf.card = iterator;
+      failed = 0;
+     return true;
+    }
+   iterator++;
+  }
+      //Serial.println(ID);
+      //Serial.println("Entry DENIED!");
+ return false;
+}
+
+void open_the_door() {
+
+  digitalWrite(DOOR_TRIGGER_PIN, HIGH);
+  delay (DOOR_OPEN_TIME);
+  digitalWrite(DOOR_TRIGGER_PIN, LOW);
+}
+
+
+//Power saving functions
+
+
+void system_sleep() {
+
+  cbi(ADCSRA,ADEN);                    // switch Analog to Digitalconverter OFF
+
+  set_sleep_mode(SLEEP_MODE_PWR_DOWN); // sleep mode is set here
+  sleep_enable();
+
+  sleep_mode();                        // System sleeps here
+}
+
+//****************************************************************
+// 0=16ms, 1=32ms,2=64ms,3=128ms,4=250ms,5=500ms
+// 6=1 sec,7=2 sec, 8=4 sec, 9= 8sec
+void setup_watchdog(int ii) {
+
+  byte bb;
+  int ww;
+  if (ii > 9 ) ii=9;
+  bb=ii & 7;
+  if (ii > 7) bb|= (1<<5);
+  bb|= (1<<WDCE);
+  ww=bb;
+  //Serial.println(ww);
+
+
+  MCUSR &= ~(1<<WDRF);
+  // start timed sequence
+  WDTCSR |= (1<<WDCE) | (1<<WDE);
+  // set new watchdog timeout value
+  WDTCSR = bb;
+  WDTCSR |= _BV(WDIE);
+}
+//****************************************************************  
+// Watchdog Interrupt Service / is executed when  watchdog timed out
+ISR(WDT_vect) {
+  Sleepy::watchdogEvent();
+//  f_wdt=1;  // set global flag
+}
